@@ -1,4 +1,4 @@
-import argon from "argon2";
+import argon2 from "argon2";
 
 import {
   BasicAuthSchema,
@@ -18,109 +18,92 @@ import {
   RefreshTokenRepository,
 } from "@/repositories/refreshToken.interface.js";
 
-interface TokensOutput { accessToken: string; refreshToken: RefreshToken };
-interface AuthOutput extends TokensOutput  {user: Omit<User, 'password'>}
+interface TokensOutput {
+  accessToken: string;
+  refreshToken: RefreshToken;
+}
+interface AuthOutput extends TokensOutput {
+  user: Omit<User, "password">;
+}
 
 interface AuthBasicController {
-  login: (props: BasicAuthSchema) => Promise<AuthOutput>
-  signup: (props: BasicAuthSchema) => Promise<AuthOutput>
-  refreshToken: (props:RefreshTokenSchema) => Promise<TokensOutput>
+  login: (props: BasicAuthSchema) => Promise<AuthOutput>;
+  signup: (props: BasicAuthSchema) => Promise<AuthOutput>;
+  refreshToken: (props: RefreshTokenSchema) => Promise<TokensOutput>;
 }
 
 export const createAuthBasicController = (
   userRepo: UserRepository,
   refreshTokenRepo: RefreshTokenRepository
 ): AuthBasicController => {
-  const generateAccessToken = (userId: number) => {
-    const signedJWT = accessTokenManager.sign({ userId: userId.toString() });
+  const generateTokens = async (userId: number, tokenFamily?: string) => {
+    const [refreshToken, accessToken] = await Promise.all([
+      generateRefreshToken(userId, tokenFamily),
+      generateAccessToken(userId),
+    ]);
+    return { accessToken, refreshToken };
+  };
 
-    return signedJWT;
+  const generateAccessToken = (userId: number) => {
+    return accessTokenManager.sign({ userId: userId.toString() });
   };
 
   const generateRefreshToken = async (userId: number, tokenFamily?: string) => {
-    const expAt = new Date(new Date().getTime() + 31 * 24 * 60 * 60000); // Expire in 31 days
-    const refreshTokenExp = expAt.toISOString();
-
-    const token = await refreshTokenRepo.createToken({
+    const expAt = new Date(Date.now() + 31 * 24 * 60 * 60 * 1000);
+    return refreshTokenRepo.createToken({
       userId,
       tokenFamily,
-      expiresAt: refreshTokenExp,
+      expiresAt: expAt.toISOString(),
     });
+  };
 
-    return token;
+  const getUserOrFail = async (username: string) => {
+    const user = await userRepo.getUser(username);
+    if (!user) throw invalidLoginCredentials();
+    return user;
   };
 
   return {
-    async signup(props) {
-      const { username, password, email } = props;
+    async signup({ username, password, email }) {
+      if (await userRepo.getUser(username)) throw usernameNotAvailable();
 
-      await userRepo.getUser(username).then((res) => {
-        if (res !== null) throw usernameNotAvailable();
-      });
+      const [hashedPass, newUser] = await Promise.all([
+        argon2.hash(password, {
+          type: argon2.argon2id,
+          timeCost: 2,
+          parallelism: 1,
+          memoryCost: 12288, // 12 MiB for better performance/security balance
+        }),
+        userRepo.createAuthBasicUser({ username, email }),
+      ]);
 
-      // timeCost, parallelism and memoryCost configured according to OWASP recommendations: https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
-      const hashedPass = await argon.hash(password, {
-        timeCost: 2,
-        parallelism: 1,
-        memoryCost: 19456, // 19 MiB
-      });
-
-      const newUser = await userRepo.createAuthBasicUser({
-        username,
-        hashedPass,
-        email,
-      });
-
-      const refreshToken = await generateRefreshToken(newUser.userId);
-      const accessToken = generateAccessToken(newUser.userId);
+      newUser.password = hashedPass;
+      const { accessToken, refreshToken } = await generateTokens(newUser.userId);
 
       const { password: _, ...userRes } = newUser;
-
       return { user: userRes, accessToken, refreshToken };
     },
-    
-    async login(props) {
-      const { username, password } = props;
 
-      const user = await userRepo.getUser(username).then((res) => {
-        if (res === null) throw invalidLoginCredentials();
-        return res;
-      });
+    async login({ username, password }) {
+      const user = await getUserOrFail(username);
 
-      const hashedPass = user.password;
-      const isOk = await argon.verify(hashedPass, password);
+      const isOk = await argon2.verify(user.password, password);
+      if (!isOk) throw invalidLoginCredentials();
 
-      if (isOk) {
-        const refreshToken = await generateRefreshToken(user.userId);
-        const accessToken = generateAccessToken(user.userId);
-
-        const { password: _, ...userRes } = user;
-
-        return { user: userRes, accessToken, refreshToken };
-      }
-
-      throw invalidLoginCredentials();
+      const { accessToken, refreshToken } = await generateTokens(user.userId);
+      const { password: _, ...userRes } = user;
+      return { user: userRes, accessToken, refreshToken };
     },
 
-    async refreshToken({ token }: RefreshTokenSchema) {
+    async refreshToken({ token }) {
       const tokenData = await refreshTokenRepo.getToken(token);
-
-      if (!tokenData) throw forbiddenError();
-
-      const { userId, tokenFamily, active } = tokenData;
-
-      if (active) {
-        // Token is valid and hasn't been used yet
-        const newRefreshToken = await generateRefreshToken(userId, tokenFamily);
-        const accessToken = generateAccessToken(userId);
-
-        return { accessToken, refreshToken: newRefreshToken };
-      } else {
-        // Previously refreshed token used, invalidate all tokens in family
-        refreshTokenRepo.invalidateTokenFamily(tokenFamily);
-
+      if (!tokenData || !tokenData.active) {
+        if (tokenData) refreshTokenRepo.invalidateTokenFamily(tokenData.tokenFamily);
         throw forbiddenError();
       }
+
+      const { accessToken, refreshToken } = await generateTokens(tokenData.userId, tokenData.tokenFamily);
+      return { accessToken, refreshToken };
     },
   };
 };
